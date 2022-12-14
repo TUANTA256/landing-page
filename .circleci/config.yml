@@ -1,0 +1,134 @@
+version: 2.1
+
+orbs:
+  aws-eks: circleci/aws-eks@2.2.0
+  kubernetes: circleci/kubernetes@1.3.1
+
+commands:
+  cluster-destroy:
+    description: Destroy EKS by cloudformation
+    parameters:
+      cluster-name:
+        description: Name of the EKS cluster
+        type: string
+        default: app-cluster
+    steps:
+      - run:
+          name: Destroy eks stacks
+          when: on_fail
+          command: |
+            aws cloudformation delete-stack \
+            --stack-name eksctl-<<parameters.cluster-name>>-cluster
+
+jobs:
+  nginxApp-lint:
+    docker:
+      - image: python:3.7.3-stretch
+    steps:
+      - checkout
+      - run:
+          name: Make install
+          command: |
+            make install
+      - run:
+          name: Make lint
+          command: |
+            make lint
+
+  docker-build:
+    docker:
+      - image: cimg/go:1.17
+        auth:
+          username: $DOCKER_USER
+          password: $DOCKERHUB_PASSWORD
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 20.10.14
+          docker_layer_caching: true
+      - run: |
+          TAG=0.1.$CIRCLE_BUILD_NUM
+          docker build -t app:$TAG .
+          echo $DOCKERHUB_PASSWORD | docker login -u $DOCKER_USER --password-stdin
+          docker tag app:$TAG $DOCKER_USER/app:$TAG
+          docker push $DOCKER_USER/app:$TAG
+
+  cluster-build:
+    docker:
+      - image: "cimg/python:3.10"
+    parameters:
+      cluster-name:
+        description: Name of the EKS cluster
+        type: string
+        default: app-cluster
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies
+          command: |
+            sudo apt install -y curl
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -qq awscliv2.zip
+            sudo ./aws/install
+      - aws-eks/install-aws-iam-authenticator:
+          release-tag: ""
+      - kubernetes/install:
+          kubectl-version: v1.22.0
+      - aws-eks/create-cluster:
+          cluster-name: << parameters.cluster-name >>
+      - run:
+          command: |
+            kubectl get services
+          name: Test cluster
+      - cluster-destroy
+
+  app-deployment:
+    docker:
+      - image: "cimg/python:3.10"
+    parameters:
+      cluster-name:
+        description: Name of the EKS cluster.
+        type: string
+        default: app-cluster
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies
+          command: |
+            sudo apt install -y curl
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -qq awscliv2.zip
+            sudo ./aws/install
+      - run:
+          name: Pass docker image ID to deployment
+          command: |
+            export dockerid=$(($CIRCLE_BUILD_NUM - 2))
+            TAG=0.1.$dockerid
+            cat app.yaml | sed "s/{{TAG_ID}}/$TAG/g" > app_tmp.yaml
+            mv app_tmp.yaml app.yaml
+      - aws-eks/update-kubeconfig-with-authenticator:
+          cluster-name: << parameters.cluster-name >>
+          install-kubectl: true
+      - kubernetes/create-or-update-resource:
+          resource-file-path: app.yaml
+          resource-name: deployment/app
+      - run:
+          name: Test cluster/deployment
+          command: |
+            kubectl get nodes
+            kubectl get services
+            kubectl get deployment 
+            kubectl get pods
+            kubectl describe pods
+      - cluster-destroy
+
+workflows:
+  AppDeployment:
+    jobs:
+      - nginxApp-lint
+      - docker-build:
+          requires: [nginxApp-lint]
+      - cluster-build:
+          requires: [docker-build]
+      - app-deployment:
+          requires: [cluster-build]
